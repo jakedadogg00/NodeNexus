@@ -1,0 +1,47 @@
+#!/usr/bin/env node
+
+import net from 'node:net';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const args = process.argv.slice(2);
+const serverName = args[0] || 'filesystem';
+const extraArgs = args.slice(1).join(' ');
+const socketPath = '/tmp/nodepool.sock';
+
+function connectSocket(retries = 3) {
+  const socket = net.createConnection(socketPath, () => {
+    // Send initialization header with optional extra arguments
+    const header = extraArgs ? `INIT ${serverName} ${extraArgs}\n` : `INIT ${serverName}\n`;
+    socket.write(header);
+
+    // Bidirectional stdio pipe
+    process.stdin.pipe(socket);
+    socket.pipe(process.stdout);
+  });
+
+  socket.on('error', (err) => {
+    if (retries > 0) {
+      // Auto-start NodePool daemon if socket is missing
+      const serverPath = path.join(__dirname, '../src/server.js');
+      const daemon = spawn(process.execPath, [serverPath], {
+        detached: true,
+        stdio: 'ignore'
+      });
+      daemon.unref();
+
+      setTimeout(() => connectSocket(retries - 1), 350);
+    } else {
+      process.stderr.write(`[nodepool-proxy] Error connecting to daemon: ${err.message}\n`);
+      process.exit(1);
+    }
+  });
+
+  socket.on('close', () => {
+    process.exit(0);
+  });
+}
+
+connectSocket();

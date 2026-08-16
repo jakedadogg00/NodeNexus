@@ -1,0 +1,117 @@
+#!/usr/bin/env node
+
+import http from 'node:http';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = 18890;
+
+async function request(path, method = 'GET', body = null) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: PORT,
+      path,
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {}
+    }, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve(data);
+        }
+      });
+    });
+
+    req.on('error', err => reject(err));
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
+}
+
+const args = process.argv.slice(2);
+const command = args[0] || 'status';
+const target = args[1];
+
+async function main() {
+  if (command === 'status') {
+    try {
+      const data = await request('/api/pool/status');
+      console.log('\n================== NODE NEXUS: ON-DEMAND MCP POOL ==================');
+      console.log(`Pool Servers: ${data.totalCatalogServers} Total | ${data.warmInstancesCount} Warm | ${data.sleepingInstancesCount} Sleeping (0 MB RAM)`);
+      console.log(`Estimated Memory Saved: ~${data.estimatedSavedMB} MB RAM`);
+      console.log(`Total Handled Requests: ${data.metrics.totalRequests} | Total Spawns: ${data.metrics.totalSpawns}`);
+      console.log('--------------------------------------------------------------------');
+      console.log('SERVER\t\tSTATUS\t\tPID\tIDLE TIMER\tREQUESTS');
+      console.log('--------------------------------------------------------------------');
+      data.servers.forEach(s => {
+        const statusStr = s.status === 'warm' ? '\x1b[32mWARM\x1b[0m' : '\x1b[34mSLEEPING (0MB)\x1b[0m';
+        const pidStr = s.pid ? String(s.pid) : '-';
+        const idleStr = s.status === 'warm' ? `${s.idleRemainingSec}s remaining` : 'Asleep';
+        const tab = s.name.length < 8 ? '\t\t' : '\t';
+        console.log(`${s.name}${tab}${statusStr}\t\t${pidStr}\t${idleStr}\t${s.requestCount}`);
+      });
+      console.log('====================================================================\n');
+    } catch (err) {
+      console.log('[NodePool] Daemon is not currently running. Start with: nodepool start');
+    }
+  } else if (command === 'warm' && target) {
+    try {
+      console.log(`[NodePool] Warming up server '${target}'...`);
+      const res = await request(`/api/pool/${target}/warm`, 'POST');
+      console.log(`[NodePool] Server '${target}' is now warm (PID: ${res.pid})`);
+    } catch (err) {
+      console.error(`[NodePool] Error: ${err.message}`);
+    }
+  } else if (command === 'sleep' && target) {
+    try {
+      console.log(`[NodePool] Spinning down server '${target}'...`);
+      await request(`/api/pool/${target}/sleep`, 'POST');
+      console.log(`[NodePool] Server '${target}' has spun down to 0 MB RAM.`);
+    } catch (err) {
+      console.error(`[NodePool] Error: ${err.message}`);
+    }
+  } else if (command === 'sleep-all') {
+    try {
+      console.log('[NodePool] Spinning down all warm pool instances...');
+      await request('/api/pool/sleep-all', 'POST');
+      console.log('[NodePool] All servers spun down to 0 MB RAM.');
+    } catch (err) {
+      console.error(`[NodePool] Error: ${err.message}`);
+    }
+  } else if (command === 'start') {
+    const serverPath = path.join(__dirname, '../src/server.js');
+    const child = spawn(process.execPath, [serverPath], {
+      detached: true,
+      stdio: 'ignore'
+    });
+    child.unref();
+    console.log(`[NodePool] Started NodeNexus daemon (PID: ${child.pid}). Dashboard at http://127.0.0.1:${PORT}`);
+  } else if (command === 'stop') {
+    try {
+      const { exec } = await import('node:child_process');
+      exec('pgrep -f "openclaw/sysgov/src/server.js"', (err, stdout) => {
+        const pids = (stdout || '').trim().split('\n').filter(Boolean);
+        pids.forEach(p => process.kill(parseInt(p, 10), 'SIGTERM'));
+        console.log('[NodePool] Stopped daemon.');
+      });
+    } catch (e) {
+      console.log('[NodePool] No running daemon found.');
+    }
+  } else {
+    console.log('Usage:');
+    console.log('  nodepool status             - View on-demand pool status & memory savings');
+    console.log('  nodepool warm <server>      - Pre-warm a specific MCP server');
+    console.log('  nodepool sleep <server>     - Spin down a specific MCP server immediately');
+    console.log('  nodepool sleep-all          - Spin down all servers (drop RAM to 0)');
+    console.log('  nodepool start              - Launch the NodeNexus daemon');
+    console.log('  nodepool stop               - Stop the daemon');
+  }
+}
+
+main();

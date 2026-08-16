@@ -1,0 +1,18 @@
+{
+  "name": "openclaw-sysgov",
+  "version": "1.0.0",
+  "description": "Ultra-lightweight macOS Node & System Resource Governor Agent",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "sysgov": "./bin/sysgov"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "status": "node bin/sysgov status",
+    "optimize": "node bin/sysgov optimize"
+  },
+  "keywords": ["macos", "optimizer", "node-process-manager", "mcp-governor", "qos"],
+  "author": "OpenClaw Team",
+  "license": "MIT"
+}
