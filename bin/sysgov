@@ -1,90 +1,154 @@
 #!/usr/bin/env node
 
 import http from 'node:http';
-import { exec, spawn } from 'node:child_process';
-import util from 'node:util';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const execPromise = util.promisify(exec);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = 18890;
+const PORT = process.env.SYSGOV_PORT || 18890;
+const HOST = '127.0.0.1';
 
-async function request(path, method = 'GET') {
+const command = process.argv[2] || 'status';
+const targetArg = process.argv[3];
+
+async function apiRequest(endpoint, method = 'GET', body = null) {
   return new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: '127.0.0.1',
+    const options = {
+      hostname: HOST,
       port: PORT,
-      path,
-      method
-    }, res => {
+      path: endpoint,
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 3000
+    };
+
+    const req = http.request(options, (res) => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
         try {
           resolve(JSON.parse(data));
         } catch (e) {
-          resolve(data);
+          resolve({ error: 'Invalid JSON response', raw: data });
         }
       });
     });
 
-    req.on('error', err => reject(err));
+    req.on('error', (err) => reject(err));
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Connection timed out to SysGov daemon'));
+    });
+
+    if (body) req.write(JSON.stringify(body));
     req.end();
   });
 }
 
-const args = process.argv.slice(2);
-const command = args[0] || 'status';
-
 async function main() {
-  if (command === 'status') {
-    try {
-      const data = await request('/api/status');
-      console.log('\n================== OPENCLAW SYSTEM GOVERNOR ==================');
-      console.log(`Status: ACTIVE | Dashboard: http://127.0.0.1:${PORT}`);
-      console.log(`Memory: ${data.memory.usedGB}GB / ${data.memory.totalGB}GB (${data.memory.memPressurePercent}% pressure)`);
-      console.log(`CPU Load: ${data.memory.loadAvg.map(n => n.toFixed(2)).join(', ')}`);
-      console.log('--------------------------------------------------------------');
-      console.log('PID\tRSS(MB)\tCPU(%)\tSTATE\tCATEGORY\tNAME');
-      console.log('--------------------------------------------------------------');
-      data.processes.forEach(p => {
-        const stateStr = p.isPaused ? 'PAUSED' : 'RUNNING';
-        console.log(`${p.pid}\t${p.rssMB}\t${p.cpu.toFixed(1)}\t${stateStr}\t${p.category}\t${p.friendlyName}`);
+  try {
+    if (command === 'start') {
+      const serverPath = path.join(__dirname, '../src/server.js');
+      const child = spawn(process.execPath, [serverPath], {
+        detached: true,
+        stdio: 'ignore'
       });
-      console.log('==============================================================\n');
-    } catch (err) {
-      console.log(`[SysGov] Daemon is not currently running. Start with: sysgov start`);
+      child.unref();
+      console.log(`[SysGov] Started daemon (PID: ${child.pid}). Dashboard at http://${HOST}:${PORT}`);
+      process.exit(0);
     }
-  } else if (command === 'optimize') {
-    try {
-      console.log('[SysGov] Triggering optimization pass...');
-      const res = await request('/api/optimize', 'POST');
-      console.log(`[SysGov] ${res.summary}`);
-    } catch (err) {
-      console.error(`[SysGov] Error contacting daemon: ${err.message}`);
-    }
-  } else if (command === 'start') {
-    const serverPath = path.join(__dirname, '../src/server.js');
-    const child = spawn(process.execPath, [serverPath], {
-      detached: true,
-      stdio: 'ignore'
-    });
-    child.unref();
-    console.log(`[SysGov] Started daemon (PID: ${child.pid}). Dashboard at http://127.0.0.1:${PORT}`);
-  } else if (command === 'stop') {
-    try {
-      const { stdout } = await execPromise(`pgrep -f "openclaw/sysgov/src/server.js"`);
-      const pids = stdout.trim().split('\n').filter(Boolean);
-      for (const pid of pids) {
-        process.kill(parseInt(pid, 10), 'SIGTERM');
-      }
+
+    if (command === 'stop') {
+      try {
+        await apiRequest('/api/shutdown', 'POST');
+      } catch (e) {}
+      const { execSync } = await import('node:child_process');
+      execSync('pkill -f "sysgov/src/server.js" 2>/dev/null || true');
       console.log('[SysGov] Stopped daemon.');
-    } catch (e) {
-      console.log('[SysGov] No running daemon found.');
+      process.exit(0);
     }
-  } else {
-    console.log(`Usage: sysgov [status | optimize | start | stop]`);
+
+    if (command === 'health') {
+      const health = await apiRequest('/api/health');
+      console.log(JSON.stringify(health, null, 2));
+      process.exit(0);
+    }
+
+    if (command === 'workloads') {
+      const workloads = await apiRequest('/api/workloads');
+      console.log('\n======================== CLASSIFIED WORKLOADS ========================');
+      console.log('PID\tWORKLOAD TYPE\tNAME\t\t\tRAM\tPROTECTED');
+      console.log('----------------------------------------------------------------------');
+      for (const w of workloads) {
+        console.log(`${w.pid}\t${w.workloadType}\t${w.friendlyName.padEnd(20)}\t${w.rssMB} MB\t${w.isProtected ? 'YES' : 'NO'}`);
+      }
+      console.log('======================================================================\n');
+      process.exit(0);
+    }
+
+    if (command === 'forecast') {
+      const forecast = await apiRequest('/api/forecast');
+      console.log('\n======================== RESOURCE FORECAST ========================');
+      console.log(`Trend:                  ${forecast.trend || 'N/A'}`);
+      console.log(`Slope (MB/min):         ${forecast.slopeMBPerMin || 0} MB/min`);
+      console.log(`Minutes to Critical:    ${forecast.minutesUntilCritical !== null ? forecast.minutesUntilCritical + ' min' : 'N/A (Nominal)'}`);
+      console.log(`EWMA Baseline:          ${forecast.ewmaMB || 0} MB`);
+      console.log(`Forecast Confidence:    ${Math.round((forecast.confidence || 0) * 100)}%`);
+      console.log('===================================================================\n');
+      process.exit(0);
+    }
+
+    if (command === 'policies') {
+      const pol = await apiRequest('/api/policies');
+      console.log(JSON.stringify(pol, null, 2));
+      process.exit(0);
+    }
+
+    if (command === 'optimize') {
+      const isDryRun = process.argv.includes('--dry-run');
+      console.log(`[SysGov] Triggering optimization (Dry-run: ${isDryRun})...`);
+      const res = await apiRequest(`/api/optimize?dryRun=${isDryRun}`, 'POST');
+      console.log(JSON.stringify(res, null, 2));
+      process.exit(0);
+    }
+
+    if (command === 'rollback') {
+      if (!targetArg) {
+        console.error('Usage: sysgov rollback <actionId>');
+        process.exit(1);
+      }
+      const res = await apiRequest(`/api/rollback/${targetArg}`, 'POST');
+      console.log(JSON.stringify(res, null, 2));
+      process.exit(0);
+    }
+
+    if (command === 'safe-mode') {
+      const res = await apiRequest('/api/safe-mode', 'POST');
+      console.log('[SysGov] Safe Mode activated.');
+      process.exit(0);
+    }
+
+    // Default: status
+    const data = await apiRequest('/api/status');
+    const telem = data.status?.telemetry;
+    const forecast = data.status?.forecast;
+    const pool = data.pool;
+
+    console.log('\n==================== OPENCLAW SYSGOV v3.0 STATUS ====================');
+    console.log(`Status:         ${data.status?.status?.toUpperCase()} (Mode: ${data.status?.mode})`);
+    console.log(`Governor Footprint: ${telem?.governor?.rssMB || 0} MB RSS | ${telem?.governor?.heapUsedMB || 0} MB Heap | Latency: ${telem?.governor?.sampleLatencyMs || 0}ms`);
+    console.log(`Memory Usage:   ${telem?.system?.memory?.usedMB || 0} MB / ${telem?.system?.memory?.totalMB || 0} MB (${telem?.system?.memory?.pressureScore || 0}% Pressure)`);
+    console.log(`System Load:    ${telem?.system?.loadAvg?.map(l => l.toFixed(2)).join(', ') || 'N/A'}`);
+    console.log(`WindowServer:   ${telem?.system?.windowServer?.cpu || 0}% CPU | ${telem?.system?.windowServer?.rssMB || 0} MB RAM (Responsive: ${telem?.system?.windowServer?.responsive ? 'YES' : 'NO'})`);
+    console.log(`Forecast Trend: ${forecast?.trend || 'stabilizing'} (${forecast?.slopeMBPerMin || 0} MB/min)`);
+    console.log(`NodeNexus Pool: ${pool?.warmInstancesCount || 0} Warm / ${pool?.sleepingInstancesCount || 0} Sleeping | ~${pool?.estimatedSavedMB || 0} MB Saved`);
+    console.log('====================================================================\n');
+
+  } catch (err) {
+    console.error(`[SysGov CLI] Error: ${err.message}`);
+    console.log('Make sure the daemon is running with: sysgov start');
+    process.exit(1);
   }
 }
 

@@ -1,18 +1,36 @@
-import { exec, execSync, spawn } from 'node:child_process';
-import os from 'node:os';
-import util from 'node:util';
-
-const execPromise = util.promisify(exec);
+import { CoreTelemetry } from './core/telemetry.js';
+import { IdentityClassifier } from './identity/classifier.js';
+import { PolicyEngine, POLICY_MODES } from './policy/engine.js';
+import { ResourceForecaster } from './forecast/forecaster.js';
+import { ActuatorRegistry } from './actuator/actuators.js';
+import { AIAdvisor } from './ai/advisor.js';
+import { RemoteAgentBridge } from './bridge/pi_bridge.js';
+import { RecoveryWatchdog } from './recovery/watchdog.js';
 
 export class SystemGovernor {
   constructor(options = {}) {
-    this.maxNodeRSSMB = options.maxNodeRSSMB || 1500; // max total RSS threshold
-    this.perProcessMaxMB = options.perProcessMaxMB || 600;
-    this.pollIntervalMs = options.pollIntervalMs || 5000;
-    this.managedPids = new Map(); // pid -> { state, name, category, qosApplied, lastSeen }
-    this.timer = null;
+    this.pollIntervalMs = options.pollIntervalMs || 4000;
     this.isGoverning = false;
+    this.timer = null;
     this.logs = [];
+
+    // Core Modular Subsystems
+    this.telemetry = new CoreTelemetry({ baseIntervalMs: this.pollIntervalMs });
+    this.identity = new IdentityClassifier();
+    this.policy = new PolicyEngine(options.policyConfig || {});
+    this.forecaster = new ResourceForecaster();
+    this.actuators = new ActuatorRegistry();
+    this.ai = new AIAdvisor({ enabled: options.enableAI || false });
+    this.bridge = new RemoteAgentBridge();
+    this.watchdog = new RecoveryWatchdog(this.policy, this.actuators);
+
+    this.latestState = {
+      telemetry: null,
+      workloads: [],
+      forecast: null,
+      mode: this.policy.mode,
+      activeIncidents: []
+    };
   }
 
   log(message, type = 'info') {
@@ -22,237 +40,112 @@ export class SystemGovernor {
       message
     };
     this.logs.unshift(entry);
-    if (this.logs.length > 200) this.logs.pop();
+    if (this.logs.length > 250) this.logs.pop();
     console.log(`[SysGov][${type.toUpperCase()}] ${message}`);
   }
 
-  async getSystemMemoryStats() {
+  async runCycle() {
     try {
-      const totalMemBytes = os.totalmem();
-      const freeMemBytes = os.freemem();
-      const loadAvg = os.loadavg();
+      // 1. Collect Telemetry
+      const telem = await this.telemetry.collectTelemetry();
+      this.latestState.telemetry = telem;
 
-      // vm_stat for accurate macOS page breakdown
-      let pageStats = { active: 0, wired: 0, compressed: 0, free: 0 };
-      try {
-        const { stdout } = await execPromise('vm_stat');
-        const lines = stdout.split('\n');
-        const pageSize = 4096; // 4KB pages
-        for (const line of lines) {
-          if (line.includes('Pages free:')) {
-            pageStats.free = parseInt(line.split(':')[1].trim().replace('.', ''), 10) * pageSize;
-          } else if (line.includes('Pages active:')) {
-            pageStats.active = parseInt(line.split(':')[1].trim().replace('.', ''), 10) * pageSize;
-          } else if (line.includes('Pages wired down:')) {
-            pageStats.wired = parseInt(line.split(':')[1].trim().replace('.', ''), 10) * pageSize;
-          } else if (line.includes('Pages occupied by compressor:')) {
-            pageStats.compressed = parseInt(line.split(':')[1].trim().replace('.', ''), 10) * pageSize;
+      // 2. Watchdog Self-Check
+      this.watchdog.checkHealth(telem.governor);
+
+      // 3. Scan & Classify Workloads
+      const workloads = await this.identity.scanAndClassifyAll();
+      this.latestState.workloads = workloads;
+
+      // 4. Calculate Resource Forecast
+      const forecast = this.forecaster.recordSample(telem);
+      this.latestState.forecast = forecast;
+      this.latestState.mode = this.policy.mode;
+
+      // 5. Check Invariants & Apply Policy-Governed Optimizations
+      await this.evaluateAndAct(telem, workloads, forecast);
+
+      this.watchdog.recordSuccess();
+    } catch (err) {
+      this.log(`Cycle execution error: ${err.message}`, 'error');
+      this.watchdog.recordFailure(err);
+    }
+  }
+
+  async evaluateAndAct(telem, workloads, forecast) {
+    const nodeWorkloads = workloads.filter(w => w.workloadType.includes('mcp') || w.workloadType.includes('node'));
+    const totalNodeRSSMB = nodeWorkloads.reduce((sum, w) => sum + w.rssMB, 0);
+
+    const isSystemCritical = telem.system.memory.pressureScore > this.policy.memoryPressureThresholdPercent;
+    const isNodeBudgetExceeded = totalNodeRSSMB > this.policy.maxTotalNodeRSSMB;
+
+    if (isSystemCritical || isNodeBudgetExceeded || forecast.trend === 'rapidly_growing') {
+      this.log(`Resource pressure threshold triggered (Node: ${totalNodeRSSMB}MB / ${this.policy.maxTotalNodeRSSMB}MB, Pressure: ${telem.system.memory.pressureScore}%, Forecast: ${forecast.trend})`, 'warn');
+
+      for (const workload of nodeWorkloads) {
+        // Skip protected workloads
+        if (workload.isProtected) continue;
+
+        // Policy Check 1: QoS Backgrounding for heavy background workers
+        const qosDecision = this.policy.evaluateWorkloadAction(workload, { type: 'qos_background' });
+        if (qosDecision.allowed) {
+          await this.actuators.applyQoSEfficiency(workload.pid, 'memory_pressure_mitigation');
+        }
+
+        // Policy Check 2: Orphan Reaping
+        if (workload.isOrphan) {
+          const termDecision = this.policy.evaluateWorkloadAction(workload, { type: 'terminate' });
+          if (termDecision.allowed) {
+            this.log(`Reaping verified orphaned worker: ${workload.friendlyName} (PID ${workload.pid})`, 'reap');
+            await this.actuators.terminateProcess(workload.pid, false, 'orphan_reap');
           }
         }
-      } catch (e) {
-        // Fallback
       }
-
-      const usedMemBytes = totalMemBytes - freeMemBytes;
-      const memPressurePercent = Math.round(((totalMemBytes - (pageStats.free || freeMemBytes)) / totalMemBytes) * 100);
-
-      return {
-        totalGB: (totalMemBytes / (1024 ** 3)).toFixed(2),
-        freeGB: (freeMemBytes / (1024 ** 3)).toFixed(2),
-        usedGB: (usedMemBytes / (1024 ** 3)).toFixed(2),
-        memPressurePercent,
-        loadAvg,
-        pageStats: {
-          activeMB: Math.round(pageStats.active / (1024 ** 2)),
-          wiredMB: Math.round(pageStats.wired / (1024 ** 2)),
-          compressedMB: Math.round(pageStats.compressed / (1024 ** 2)),
-        }
-      };
-    } catch (err) {
-      return { totalGB: '0', freeGB: '0', usedGB: '0', memPressurePercent: 0, loadAvg: [0, 0, 0] };
     }
   }
 
-  async scanProcesses() {
-    try {
-      // Get all processes with PID, PPID, %CPU, %MEM, RSS (KB), STAT, and COMMAND
-      const { stdout } = await execPromise('ps -eo pid,ppid,%cpu,%mem,rss,stat,command');
-      const lines = stdout.trim().split('\n');
-      const processes = [];
+  async optimizeAll(dryRun = false) {
+    this.log(`Running comprehensive optimization pass (Dry-Run: ${dryRun})...`, 'optimize');
+    const workloads = await this.identity.scanAndClassifyAll();
+    let qosApplied = 0;
+    let orphansReaped = 0;
+    const actionsTaken = [];
 
-      for (let i = 1; i < lines.length; i++) {
-        const line = lines[i].trim();
-        if (!line) continue;
+    for (const w of workloads) {
+      if (w.isProtected) continue;
 
-        const parts = line.split(/\s+/);
-        if (parts.length < 7) continue;
-
-        const pid = parseInt(parts[0], 10);
-        const ppid = parseInt(parts[1], 10);
-        const cpu = parseFloat(parts[2]);
-        const mem = parseFloat(parts[3]);
-        const rssKB = parseInt(parts[4], 10);
-        const stat = parts[5];
-        const command = parts.slice(6).join(' ');
-
-        const isNode = command.includes('node') || command.includes('npx') || command.includes('bun') || command.includes('deno');
-        const isPython = command.includes('python') || command.includes('uvicorn') || command.includes('gunicorn');
-        const isWindowServer = command.includes('WindowServer');
-        const isMCP = command.includes('mcp-') || command.includes('mcpmux') || command.includes('mcpfinder') || command.includes('firecrawl-mcp') || command.includes('pinecone-mcp') || command.includes('n8n-mcp');
-
-        if (!isNode && !isPython && !isWindowServer && !isMCP) continue;
-        if (pid === process.pid) continue; // Don't manage self
-
-        const rssMB = Math.round(rssKB / 1024);
-        let category = 'other';
-        let friendlyName = 'Process';
-
-        if (isWindowServer) {
-          category = 'system-ui';
-          friendlyName = 'macOS WindowServer';
-        } else if (isMCP) {
-          category = 'mcp-server';
-          const match = command.match(/mcp-server-[a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+-mcp|mcpmux|mcpfinder|firecrawl-mcp|pinecone-mcp|n8n-mcp/i);
-          friendlyName = match ? match[0] : 'MCP Server';
-        } else if (command.includes('openclaw')) {
-          category = 'openclaw-agent';
-          friendlyName = 'OpenClaw Agent Core';
-        } else if (command.includes('camofox')) {
-          category = 'browser-automation';
-          friendlyName = 'Camofox Browser Server';
-        } else if (isNode) {
-          category = 'node-runtime';
-          const parts = command.split(' ');
-          const script = parts.find(p => p.endsWith('.js') || p.endsWith('.ts') || p.includes('/bin/')) || 'node';
-          friendlyName = `Node (${script.split('/').pop()})`;
-        } else if (isPython) {
-          category = 'python-runtime';
-          friendlyName = 'Python Worker';
-        }
-
-        const isPaused = stat.includes('T');
-        const isOrphan = (ppid === 1 && category === 'mcp-server');
-
-        processes.push({
-          pid,
-          ppid,
-          cpu,
-          mem,
-          rssMB,
-          stat,
-          command,
-          category,
-          friendlyName,
-          isPaused,
-          isOrphan
-        });
-      }
-
-      return processes;
-    } catch (err) {
-      this.log(`Failed to scan processes: ${err.message}`, 'error');
-      return [];
-    }
-  }
-
-  async applyQoSEfficiency(pid) {
-    try {
-      // macOS taskpolicy -b -p <pid> puts process in background QoS (efficiency cores)
-      await execPromise(`taskpolicy -b -p ${pid} 2>/dev/null || true`);
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  async pauseProcess(pid) {
-    try {
-      process.kill(pid, 'SIGSTOP');
-      this.log(`Paused process PID ${pid} (SIGSTOP)`, 'action');
-      return true;
-    } catch (err) {
-      this.log(`Failed to pause PID ${pid}: ${err.message}`, 'error');
-      return false;
-    }
-  }
-
-  async resumeProcess(pid) {
-    try {
-      process.kill(pid, 'SIGCONT');
-      this.log(`Resumed process PID ${pid} (SIGCONT)`, 'action');
-      return true;
-    } catch (err) {
-      this.log(`Failed to resume PID ${pid}: ${err.message}`, 'error');
-      return false;
-    }
-  }
-
-  async terminateProcess(pid, force = false) {
-    try {
-      const sig = force ? 'SIGKILL' : 'SIGTERM';
-      process.kill(pid, sig);
-      this.log(`Terminated process PID ${pid} (${sig})`, 'action');
-      return true;
-    } catch (err) {
-      this.log(`Failed to terminate PID ${pid}: ${err.message}`, 'error');
-      return false;
-    }
-  }
-
-  async optimizeAll() {
-    this.log('Running automatic comprehensive optimization pass...', 'optimize');
-    const processes = await this.scanProcesses();
-    let optimizedCount = 0;
-    let reapedCount = 0;
-    let deduplicatedCount = 0;
-
-    const seenMCPs = new Map(); // name -> pid
-
-    for (const proc of processes) {
-      // 1. Move background MCP and Node processes to Apple Silicon Efficiency Cores (taskpolicy -b)
-      if (proc.category === 'mcp-server' || proc.category === 'python-runtime') {
-        await this.applyQoSEfficiency(proc.pid);
-        optimizedCount++;
-      }
-
-      // 2. Reaping orphaned stateless MCP servers
-      if (proc.isOrphan) {
-        this.log(`Reaping orphaned MCP process: ${proc.friendlyName} (PID ${proc.pid})`, 'reap');
-        await this.terminateProcess(proc.pid, false);
-        reapedCount++;
-        continue;
-      }
-
-      // 3. Deduplication of identical filesystem/memory MCPs if spawned by dead subagents
-      if (proc.category === 'mcp-server') {
-        const key = `${proc.friendlyName}_${proc.command.replace(/--parent-pid=\d+/, '')}`;
-        if (seenMCPs.has(key)) {
-          // If we have duplicate identical servers running and PPID is 1 or identical
-          const olderPid = seenMCPs.get(key);
-          if (proc.ppid === 1 || proc.rssMB < 10) {
-            this.log(`Deduplicating redundant MCP instance: ${proc.friendlyName} (PID ${proc.pid})`, 'dedup');
-            await this.terminateProcess(proc.pid, false);
-            deduplicatedCount++;
-            continue;
-          }
-        } else {
-          seenMCPs.set(key, proc.pid);
+      if (w.workloadType === 'mcp-worker' || w.workloadType === 'python-worker') {
+        const decision = this.policy.evaluateWorkloadAction(w, { type: 'qos_background' });
+        if (decision.allowed && !dryRun) {
+          await this.actuators.applyQoSEfficiency(w.pid, 'manual_optimize');
+          qosApplied++;
+          actionsTaken.push({ pid: w.pid, action: 'qos_background', target: w.friendlyName });
+        } else if (decision.isDryRun || dryRun) {
+          actionsTaken.push({ pid: w.pid, action: 'dry_run_qos', target: w.friendlyName });
         }
       }
 
-      // 4. Memory governor: If an individual process is exceeding perProcessMaxMB while idle
-      if (proc.rssMB > this.perProcessMaxMB && proc.cpu < 0.5 && !proc.isPaused && proc.category !== 'system-ui' && proc.category !== 'openclaw-agent') {
-        this.log(`Throttling high-RAM idle process: ${proc.friendlyName} (PID ${proc.pid}, ${proc.rssMB}MB RSS)`, 'throttle');
-        await this.applyQoSEfficiency(proc.pid);
+      if (w.isOrphan) {
+        const decision = this.policy.evaluateWorkloadAction(w, { type: 'terminate' });
+        if (decision.allowed && !dryRun) {
+          await this.actuators.terminateProcess(w.pid, false, 'orphan_cleanup');
+          orphansReaped++;
+          actionsTaken.push({ pid: w.pid, action: 'reap_orphan', target: w.friendlyName });
+        } else if (decision.isDryRun || dryRun) {
+          actionsTaken.push({ pid: w.pid, action: 'dry_run_reap_orphan', target: w.friendlyName });
+        }
       }
     }
 
-    const summary = `Optimization complete: ${optimizedCount} processes assigned to Efficiency Cores, ${reapedCount} orphans reaped, ${deduplicatedCount} duplicates consolidated.`;
+    const summary = `Optimization completed: ${qosApplied} processes scheduled on Efficiency Cores, ${orphansReaped} orphans safely reaped.`;
     this.log(summary, 'success');
+
     return {
-      optimizedCount,
-      reapedCount,
-      deduplicatedCount,
+      success: true,
+      dryRun,
+      qosApplied,
+      orphansReaped,
+      actionsTaken,
       summary
     };
   }
@@ -260,28 +153,12 @@ export class SystemGovernor {
   startGoverning() {
     if (this.isGoverning) return;
     this.isGoverning = true;
-    this.log(`Autonomous System Governor started (interval: ${this.pollIntervalMs / 1000}s, RSS Limit: ${this.maxNodeRSSMB}MB)`, 'start');
+    this.log(`OpenClaw System Governor v3.0 active (Mode: ${this.policy.mode}, Interval: ${this.pollIntervalMs}ms)`, 'start');
 
-    // Run initial optimize pass
-    this.optimizeAll().catch(e => this.log(`Initial optimize error: ${e.message}`, 'error'));
+    this.runCycle().catch(e => this.log(`Initial cycle error: ${e.message}`, 'error'));
 
     this.timer = setInterval(async () => {
-      try {
-        const memStats = await this.getSystemMemoryStats();
-        const processes = await this.scanProcesses();
-
-        const totalNodeRSS = processes
-          .filter(p => p.category.includes('node') || p.category.includes('mcp'))
-          .reduce((sum, p) => sum + p.rssMB, 0);
-
-        // If total node memory pressure exceeds threshold or system pressure is critical (>85%)
-        if (totalNodeRSS > this.maxNodeRSSMB || memStats.memPressurePercent > 85) {
-          this.log(`High memory pressure detected (Node Total: ${totalNodeRSS}MB, System: ${memStats.memPressurePercent}%). Applying auto-throttling...`, 'warn');
-          await this.optimizeAll();
-        }
-      } catch (err) {
-        this.log(`Governor cycle error: ${err.message}`, 'error');
-      }
+      await this.runCycle();
     }, this.pollIntervalMs);
   }
 
@@ -291,6 +168,19 @@ export class SystemGovernor {
       this.timer = null;
     }
     this.isGoverning = false;
-    this.log('Autonomous System Governor stopped.', 'stop');
+    this.log('System Governor stopped.', 'stop');
+  }
+
+  getStatus() {
+    return {
+      status: this.watchdog.inSafeMode ? 'safe-mode' : 'healthy',
+      mode: this.policy.mode,
+      uptimeSec: Math.round(process.uptime()),
+      telemetry: this.latestState.telemetry,
+      forecast: this.latestState.forecast,
+      workloadsCount: this.latestState.workloads.length,
+      recentActions: this.actuators.getJournal(10),
+      logs: this.logs.slice(0, 30)
+    };
   }
 }

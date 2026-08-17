@@ -7,22 +7,19 @@ import { getDashboardHtml } from './dashboard_html.js';
 const PORT = parseInt(process.env.SYSGOV_PORT || '18890', 10);
 const HOST = process.env.SYSGOV_HOST || '127.0.0.1';
 
-// 1. Initialize System Governor
+// 1. Initialize Modular System Governor
 const governor = new SystemGovernor({
-  maxNodeRSSMB: 1600,
-  perProcessMaxMB: 500,
   pollIntervalMs: 4000
 });
 
 // 2. Initialize NodePool Manager
 const poolManager = new NodePoolManager({
-  defaultIdleTimeoutMs: 60000 // 60s idle auto-spin-down
+  defaultIdleTimeoutMs: 60000
 });
 
-// Pipe pool events to governor log
 poolManager.on('log', (msg, type) => governor.log(msg, type));
 
-// 3. Start IPC Socket Server (/tmp/nodepool.sock)
+// 3. Start Local IPC Bridge (/tmp/nodepool.sock)
 const ipcServer = new NodePoolIPCServer(poolManager);
 ipcServer.start();
 
@@ -35,7 +32,7 @@ const server = http.createServer(async (req, res) => {
 
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (method === 'OPTIONS') {
     res.writeHead(204);
@@ -52,36 +49,66 @@ const server = http.createServer(async (req, res) => {
 
   // REST API: GET /api/status
   if (url.pathname === '/api/status' && method === 'GET') {
-    try {
-      const memory = await governor.getSystemMemoryStats();
-      const processes = await governor.scanProcesses();
-      const pool = poolManager.getStatus();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: 'healthy',
-        timestamp: new Date().toISOString(),
-        memory,
-        processes,
-        pool,
-        logs: governor.logs
-      }));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      status: governor.getStatus(),
+      pool: poolManager.getStatus(),
+      timestamp: new Date().toISOString()
+    }));
+    return;
+  }
+
+  // REST API: GET /api/health
+  if (url.pathname === '/api/health' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      healthy: !governor.watchdog.inSafeMode,
+      mode: governor.policy.mode,
+      governorRSS: governor.latestState.telemetry?.governor.rssMB || 0,
+      uptimeSec: Math.round(process.uptime())
+    }));
+    return;
+  }
+
+  // REST API: GET /api/workloads
+  if (url.pathname === '/api/workloads' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(governor.latestState.workloads || []));
+    return;
+  }
+
+  // REST API: GET /api/forecast
+  if (url.pathname === '/api/forecast' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(governor.latestState.forecast || {}));
+    return;
+  }
+
+  // REST API: GET /api/policies
+  if (url.pathname === '/api/policies' && method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      mode: governor.policy.mode,
+      maxTotalNodeRSSMB: governor.policy.maxTotalNodeRSSMB,
+      maxSingleProcessRSSMB: governor.policy.maxSingleProcessRSSMB,
+      memoryPressureThresholdPercent: governor.policy.memoryPressureThresholdPercent
+    }));
+    return;
+  }
+
+  // REST API: POST /api/mode/:mode
+  const modeMatch = url.pathname.match(/^\/api\/mode\/([a-zA-Z0-9_-]+)$/);
+  if (modeMatch && method === 'POST') {
+    const success = governor.policy.setMode(modeMatch[1]);
+    res.writeHead(success ? 200 : 400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success, mode: governor.policy.mode }));
     return;
   }
 
   // REST API: GET /api/pool/status
   if (url.pathname === '/api/pool/status' && method === 'GET') {
-    try {
-      const status = poolManager.getStatus();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(status));
-    } catch (err) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
-    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(poolManager.getStatus()));
     return;
   }
 
@@ -130,8 +157,9 @@ const server = http.createServer(async (req, res) => {
 
   // REST API: POST /api/optimize
   if (url.pathname === '/api/optimize' && method === 'POST') {
+    const dryRun = url.searchParams.get('dryRun') === 'true';
     try {
-      const result = await governor.optimizeAll();
+      const result = await governor.optimizeAll(dryRun);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result));
     } catch (err) {
@@ -141,20 +169,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // REST API: Process Actions /api/process/:pid/:action
-  const procMatch = url.pathname.match(/^\/api\/process\/(\d+)\/(pause|resume|kill|qos)$/);
-  if (procMatch && method === 'POST') {
-    const pid = parseInt(procMatch[1], 10);
-    const action = procMatch[2];
+  // REST API: POST /api/rollback/:actionId
+  const rollbackMatch = url.pathname.match(/^\/api\/rollback\/([a-zA-Z0-9_-]+)$/);
+  if (rollbackMatch && method === 'POST') {
+    const result = await governor.actuators.rollbackAction(rollbackMatch[1]);
+    res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
 
-    let success = false;
-    if (action === 'pause') success = await governor.pauseProcess(pid);
-    else if (action === 'resume') success = await governor.resumeProcess(pid);
-    else if (action === 'kill') success = await governor.terminateProcess(pid, false);
-    else if (action === 'qos') success = await governor.applyQoSEfficiency(pid);
+  // REST API: POST /api/safe-mode
+  if (url.pathname === '/api/safe-mode' && method === 'POST') {
+    governor.watchdog.triggerSafeMode('User initiated via API');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, mode: governor.policy.mode }));
+    return;
+  }
 
-    res.writeHead(success ? 200 : 400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success, pid, action }));
+  // REST API: POST /api/shutdown
+  if (url.pathname === '/api/shutdown' && method === 'POST') {
+    governor.watchdog.triggerEmergencyShutdown();
+    await poolManager.spinDownAll();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, message: 'Emergency shutdown complete.' }));
     return;
   }
 
@@ -163,11 +200,10 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[NodeNexus] Running at http://${HOST}:${PORT}`);
-  console.log(`[NodeNexus] IPC Socket active at /tmp/nodepool.sock`);
+  console.log(`[OpenClaw SysGov v3.0] Control Plane active at http://${HOST}:${PORT}`);
+  console.log(`[OpenClaw SysGov v3.0] IPC Bridge active at /tmp/nodepool.sock`);
 });
 
-// Clean shutdown
 process.on('SIGTERM', () => {
   poolManager.spinDownAll();
   ipcServer.stop();
